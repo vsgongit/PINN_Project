@@ -1,0 +1,9 @@
+torch>=2.0
+torchaudio
+numpy
+scipy
+matplotlib
+tensorboard
+librosa
+soundfile
+tqdm
