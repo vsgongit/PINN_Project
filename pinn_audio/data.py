@@ -44,16 +44,49 @@ def find_pairs_in_dir(root: str) -> List[Tuple[str, str, str]]:
             pairs.append((utt, d["noisy"], d["clean"]))
     return pairs
 
-def load_audio(path: str, target_sr: int) -> Tuple[torch.Tensor, int]:
-    waveform, sr = torchaudio.load(path)  # [C, T]
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    if waveform.shape[0] > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-        sr = target_sr
-    return waveform, sr
+# replace existing load_audio with this robust loader
+def load_audio(path: str, target_sr: int):
+    """
+    Robust audio loader that prefers soundfile, falls back to librosa.
+    Returns (waveform_tensor [1, T], sample_rate).
+    Ensures mono output (averages channels) and resamples to target_sr.
+    """
+    import soundfile as sf
+    try:
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        # data shape: (T, C) -> convert to (C, T)
+        data = data.T  # now (C, T)
+        # average channels if multi-channel
+        if data.shape[0] > 1:
+            data = data.mean(axis=0, keepdims=True)
+        else:
+            data = data
+        import numpy as np
+        wav = torch.from_numpy(data.astype("float32"))
+        if sr != target_sr:
+            # use torchaudio's resample if available, otherwise use librosa
+            try:
+                wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=target_sr)
+                sr = target_sr
+            except Exception:
+                # wav is numpy-like shape [1, T]
+                import librosa
+                y = wav.squeeze(0).numpy()
+                y2 = librosa.resample(y, orig_sr=sr, target_sr=target_sr, res_type="soxr")
+                wav = torch.from_numpy(y2.astype("float32")).unsqueeze(0)
+                sr = target_sr
+        return wav, sr
+    except Exception as e:
+        # fallback to librosa (can read many formats)
+        try:
+            import librosa
+            y, sr = librosa.load(path, sr=target_sr, mono=True)
+            import numpy as np
+            wav = torch.from_numpy(np.asarray(y, dtype="float32")).unsqueeze(0)
+            return wav, sr
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load audio {path}: {e}; fallback error: {e2}")
+
 
 class PairedWavWindowDataset(Dataset):
     def __init__(
@@ -82,19 +115,35 @@ class PairedWavWindowDataset(Dataset):
         self.registry = []
         for utt, noisy_path, clean_path in self.pairs:
             # Try to probe file info (fast) and convert to target-sr sample count
+
             try:
-                info = torchaudio.info(noisy_path)
-                num_frames = int(info.num_frames)
-                orig_sr = int(info.sample_rate)
-                duration_at_target = int(round(num_frames * (self.sr / float(orig_sr))))
-            except Exception:
-                # fallback: load & resample to know exact length
+                # prefer a fast torchaudio probe
                 try:
-                    w, sr0 = load_audio(noisy_path, self.sr)
-                    duration_at_target = w.shape[1]
-                except Exception as e:
-                    print(f"Warning: cannot probe/load {noisy_path}: {e}; skipping")
-                    continue
+                    info = torchaudio.info(noisy_path)
+                    num_frames = int(info.num_frames)
+                    orig_sr = int(info.sample_rate)
+                    duration_at_target = int(round(num_frames * (self.sr / float(orig_sr))))
+                except Exception:
+                    # fallback to soundfile (pysoundfile) which can read many wav variants
+                    try:
+                        import soundfile as sf
+                        sf_info = sf.info(noisy_path)
+                        num_frames = int(sf_info.frames)
+                        orig_sr = int(sf_info.samplerate)
+                        duration_at_target = int(round(num_frames * (self.sr / float(orig_sr))))
+                    except Exception:
+                        # final fallback: load whole file (slower) and resample to infer length
+                        try:
+                            w, sr0 = load_audio(noisy_path, self.sr)
+                            duration_at_target = w.shape[1]
+                        except Exception as e:
+                            print(f"Warning: cannot probe/load {noisy_path}: {e}; skipping")
+                            continue
+            except Exception as e:
+                print(f"Warning: cannot probe/load {noisy_path}: {e}; skipping")
+                continue
+
+
 
             starts = list(range(0, max(1, duration_at_target - self.win_len + 1), self.hop_len))
             if len(starts) == 0:
