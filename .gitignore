@@ -5,3 +5,6 @@ runs/
 outputs/
 *.wav
 *.ipynb_checkpoints
+dataset_root/
+checkpoints/
+runs/
